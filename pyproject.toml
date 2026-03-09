@@ -8,7 +8,7 @@ build-backend = "hatchling.build"
 [project]
 name = "tap-census"
 version = "0.0.1"
-description = "Singer tap for Census, built with the Meltano Singer SDK."
+description = "Singer tap for U.S. Census Bureau population and geographic data"
 readme = "README.md"
 authors = [{ name = "Matt Elgazar", email = "melgazar9@gmail.com" }]
 keywords = [
@@ -30,6 +30,7 @@ requires-python = ">=3.10"
 dependencies = [
     "singer-sdk~=0.53.5",
     "requests~=2.32.3",
+    "backoff>=2.2.1,<3.0.0",
     "typing-extensions>=4.5.0; python_version < '3.13'",
 ]
 

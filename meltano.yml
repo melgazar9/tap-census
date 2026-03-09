@@ -1,46 +1,58 @@
-send_anonymous_usage_stats: true
+version: 1
+send_anonymous_usage_stats: false
 project_id: "tap-census"
-default_environment: test
-requires_meltano: ">=4.0"
-environments:
-- name: test
+
 plugins:
   extractors:
-  - name: "tap-census"
-    namespace: "tap_census"
+  - name: tap-census
+    namespace: tap_census
     pip_url: -e .
     capabilities:
-    - state
-    - catalog
-    - discover
-    - about
-    - stream-maps
-    - structured-logging
-
-    # TODO: Declare settings and their types here:
+      - state
+      - catalog
+      - discover
+      - about
+      - stream-maps
     settings:
-    - name: username
-      label: Username
-      description: The username to use for authentication
-
-    - name: password
-      kind: password
-      label: Password
-      description: The password to use for authentication
-      sensitive: true
-
-    - name: start_date
-      kind: date_iso8601
-      label: Start Date
-      description: Initial date to start extracting data from
-
-    # TODO: Declare required settings here:
-    settings_group_validation:
-    - [username, password]
-
-    # TODO: Declare default configuration values here:
+      - name: api_key
+        kind: password
+        sensitive: true
+        description: Census API key (free at https://api.census.gov/data/key_signup.html)
+      - name: api_url
+        kind: string
+        value: https://api.census.gov/data
+        description: Base URL for the Census Bureau API
+      - name: years
+        kind: array
+        description: Which years to pull population estimates for
+      - name: geography_levels
+        kind: array
+        description: "Geographic levels to extract: county, state"
+      - name: datasets
+        kind: array
+        description: "Datasets to extract: pep, decennial"
+      - name: states
+        kind: array
+        description: 'State FIPS codes to filter by. ["*"] = all states'
+      - name: max_requests_per_minute
+        kind: integer
+        value: 60
+        description: Maximum API requests per minute for rate limiting
+      - name: strict_mode
+        kind: boolean
+        value: false
+        description: If true, raise exceptions on API errors instead of skipping
+    select:
+      - county_population.*
+      - state_population.*
+      - decennial_population.*
+      - county_geography.*
     config:
-      start_date: 6 months ago
+      api_key: ${CENSUS_API_KEY}
+      years: [2015, 2016, 2017, 2018, 2019, 2020, 2021]
+      geography_levels: ["county", "state"]
+      datasets: ["pep", "decennial"]
+      states: ["*"]
 
   loaders:
   - name: target-jsonl

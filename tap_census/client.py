@@ -2,17 +2,18 @@
 
 from __future__ import annotations
 
-import decimal
 import sys
+import time
+from abc import ABC
+from collections import deque
 from typing import TYPE_CHECKING, Any, ClassVar
 
-from singer_sdk import SchemaDirectory, StreamSchema
-from singer_sdk.authenticators import APIKeyAuthenticator
-from singer_sdk.helpers.jsonpath import extract_jsonpath
-from singer_sdk.pagination import BaseAPIPaginator  # noqa: TC002
+import backoff
+import requests as requests_lib
+from singer_sdk.pagination import SinglePagePaginator
 from singer_sdk.streams import RESTStream
 
-from tap_census import schemas
+from tap_census.helpers import parse_census_array
 
 if sys.version_info >= (3, 12):
     from typing import override
@@ -24,72 +25,41 @@ if TYPE_CHECKING:
 
     import requests
     from singer_sdk.helpers.types import Context
+    from singer_sdk.pagination import BaseAPIPaginator
 
 
-# TODO: Delete this is if not using json files for schema definition
-SCHEMAS_DIR = SchemaDirectory(schemas)
+class CensusStream(RESTStream, ABC):
+    """Base stream class for Census API endpoints.
 
+    Handles the Census API's unique 2D array response format, rate limiting,
+    and retry logic with exponential backoff.
+    """
 
-class CensusStream(RESTStream):
-    """Census stream class."""
-
-    # Update this value if necessary or override `parse_response`.
-    records_jsonpath = "$[*]"
-
-    # Update this value if necessary or override `get_new_paginator`.
-    next_page_token_jsonpath = "$.next_page"  # noqa: S105
-
-    schema: ClassVar[StreamSchema] = StreamSchema(SCHEMAS_DIR)
+    records_jsonpath: ClassVar[str] = "$[*]"
+    _request_timestamps: ClassVar[deque] = deque()
 
     @override
     @property
     def url_base(self) -> str:
         """Return the API URL root, configurable via tap settings."""
-        # TODO: hardcode a value here, or retrieve it from self.config
-        return "https://api.mysample.com"
+        return self.config.get("api_url", "https://api.census.gov/data")
 
     @override
     @property
-    def authenticator(self) -> APIKeyAuthenticator:
-        """Return a new authenticator object.
-
-        Returns:
-            An authenticator instance.
-        """
-        return APIKeyAuthenticator(
-            key="x-api-key",
-            value=self.config.get("auth_token", ""),
-            location="header",
-        )
+    def authenticator(self) -> None:
+        """Census API uses query parameter auth, not header auth."""
+        return None
 
     @property
     @override
     def http_headers(self) -> dict:
-        """Return the http headers needed.
-
-        Returns:
-            A dictionary of HTTP headers.
-        """
-        # If not using an authenticator, you may also provide inline auth headers:
-        # headers["Private-Token"] = self.config.get("auth_token")
-        return {}
+        """Return the http headers needed."""
+        return {"User-Agent": "tap-census/0.0.1 (Singer SDK)"}
 
     @override
-    def get_new_paginator(self) -> BaseAPIPaginator | None:
-        """Create a new pagination helper instance.
-
-        If the source API can make use of the `next_page_token_jsonpath`
-        attribute, or it contains a `X-Next-Page` header in the response
-        then you can remove this method.
-
-        If you need custom pagination that uses page numbers, "next" links, or
-        other approaches, please read the guide: https://sdk.meltano.com/en/v0.25.0/guides/pagination-classes.html.
-
-        Returns:
-            A pagination helper instance, or ``None`` to indicate pagination
-            is not supported.
-        """
-        return super().get_new_paginator()
+    def get_new_paginator(self) -> BaseAPIPaginator:
+        """Census API returns all results in a single response."""
+        return SinglePagePaginator()
 
     @override
     def get_url_params(
@@ -97,58 +67,93 @@ class CensusStream(RESTStream):
         context: Context | None,
         next_page_token: Any | None,
     ) -> dict[str, Any]:
-        """Return a dictionary of values to be used in URL parameterization.
-
-        Args:
-            context: The stream context.
-            next_page_token: The next page index or value.
-
-        Returns:
-            A dictionary of URL query parameters.
-        """
-        params: dict = {}
-        if next_page_token:
-            params["page"] = next_page_token
-        if self.replication_key:
-            params["sort"] = "asc"
-            params["order_by"] = self.replication_key
+        """Return URL query parameters including the API key."""
+        params: dict[str, Any] = {}
+        api_key = self.config.get("api_key")
+        if api_key:
+            params["key"] = api_key
         return params
 
-    @override
-    def prepare_request_payload(
-        self,
-        context: Context | None,
-        next_page_token: Any | None,
-    ) -> dict | None:
-        """Prepare the data payload for the REST API request.
+    def _throttle(self) -> None:
+        """Enforce rate limiting based on max_requests_per_minute config."""
+        max_rpm = self.config.get("max_requests_per_minute", 60)
+        now = time.monotonic()
 
-        By default, no payload will be sent (return None).
+        # Clean old timestamps outside the 60-second window
+        while self._request_timestamps and (now - self._request_timestamps[0]) > 60:
+            self._request_timestamps.popleft()
+
+        if len(self._request_timestamps) >= max_rpm:
+            wait_time = 60 - (now - self._request_timestamps[0])
+            if wait_time > 0:
+                self.logger.info("Rate limit reached, waiting %.1f seconds", wait_time)
+                time.sleep(wait_time)
+
+        self._request_timestamps.append(time.monotonic())
+
+    @backoff.on_exception(
+        backoff.expo,
+        (requests_lib.exceptions.RequestException,),
+        max_tries=5,
+        max_time=120,
+        factor=5,
+        jitter=backoff.full_jitter,
+        giveup=lambda e: (
+            isinstance(e, requests_lib.exceptions.HTTPError)
+            and e.response is not None
+            and 400 <= e.response.status_code < 500
+            and e.response.status_code != 429
+        ),
+    )
+    def _make_request(
+        self, url: str, params: dict[str, Any],
+    ) -> list[list[str]] | None:
+        """Make an HTTP request to the Census API with retry logic.
 
         Args:
-            context: The stream context.
-            next_page_token: The next page index or value.
+            url: The full URL to request.
+            params: Query parameters.
 
         Returns:
-            A dictionary with the JSON body for a POST requests.
+            Parsed JSON response (2D array) or None on non-critical failure.
         """
-        # TODO: Delete this method if no payload is required. (Most REST APIs.)
-        return None
+        self._throttle()
+        response = self.requests_session.get(url, params=params, timeout=(10, 30))
+        response.raise_for_status()
+        return response.json()
+
+    def _fetch_census_data(
+        self, url: str, params: dict[str, Any], description: str,
+    ) -> list[dict] | None:
+        """Fetch and parse Census data with standardized error handling.
+
+        Consolidates the common pattern of: make request → handle errors →
+        parse 2D array. Respects the strict_mode config setting.
+
+        Args:
+            url: The Census API URL.
+            params: Query parameters.
+            description: Human-readable description for log messages.
+
+        Returns:
+            Parsed list of record dicts, or None on failure.
+        """
+        try:
+            data = self._make_request(url, params)
+        except Exception:
+            self.logger.warning("Failed to fetch %s", description, exc_info=True)
+            if self.config.get("strict_mode", False):
+                raise
+            return None
+
+        if not data:
+            return None
+        return parse_census_array(data)
 
     @override
     def parse_response(self, response: requests.Response) -> Iterable[dict]:
-        """Parse the response and return an iterator of result records.
-
-        Args:
-            response: The HTTP ``requests.Response`` object.
-
-        Yields:
-            Each record from the source.
-        """
-        # TODO: Parse response body and return a set of records.
-        yield from extract_jsonpath(
-            self.records_jsonpath,
-            input=response.json(parse_float=decimal.Decimal),
-        )
+        """Parse the Census 2D array response into dictionaries."""
+        yield from parse_census_array(response.json())
 
     @override
     def post_process(
@@ -156,17 +161,5 @@ class CensusStream(RESTStream):
         row: dict,
         context: Context | None = None,
     ) -> dict | None:
-        """As needed, append or transform raw data to match expected structure.
-
-        Note: As of SDK v0.47.0, this method is automatically executed for all stream types.
-        You should not need to call this method directly in custom `get_records` implementations.
-
-        Args:
-            row: An individual record from the stream.
-            context: The stream context.
-
-        Returns:
-            The updated record dictionary, or ``None`` to skip the record.
-        """
-        # TODO: Delete this method if not needed.
+        """Post-process a record. Override in subclasses for transformations."""
         return row
