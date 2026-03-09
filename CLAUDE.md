@@ -1,257 +1,132 @@
-# AGENTS.md - AI Agent Development Guide for tap-census
+# CLAUDE.md
 
-This document provides guidance for AI coding agents and developers working on this Singer tap.
+This file provides guidance to Claude Code when working with code in this repository.
 
-## Project Overview
+## Critical Rules
 
-- **Project Type**: Singer Tap
-- **Source**: Census
-- **Stream Type**: REST
-- **Authentication**: API Key
-- **Framework**: Meltano Singer SDK
+1. **Never guess. Use official documentation.** All decisions must be verified against the actual Census Bureau API (https://api.census.gov/data.json) or the Singer SDK docs (https://sdk.meltano.com). Use Context7 or hit the API directly. It is better to say "I don't know" than to produce something wrong.
+2. **Never make up endpoints, variables, or API behavior.** The Census API has quirks that differ between vintages. Always verify with a live `curl` call before coding against an endpoint.
+3. **Follow reference tap patterns.** The sibling repositories `../tap-fred`, `../tap-fmp`, `../tap-massive`, `../tap-yfinance` are the canonical reference for Meltano Singer SDK tap structure.
+
+## What This Is
+
+A Meltano Singer tap for the U.S. Census Bureau API. Extracts population estimates, decennial census counts, and county geography (lat/lon centroids) for use in population-weighted energy demand forecasting (HDD/CDD). Built with the [Meltano Singer SDK](https://sdk.meltano.com).
+
+## Build & Test Commands
+
+```bash
+uv sync                                    # Install dependencies
+uv run pytest                              # Run all tests
+uv run pytest tests/test_core.py -k name   # Run tests matching pattern
+uv run tap-census --about                  # Show tap info and settings
+uv run tap-census --discover               # Validate Singer discovery
+```
 
 ## Architecture
 
-This tap follows the Singer specification and uses the Meltano Singer SDK to extract data from Census.
+### File Structure
 
-### Key Components
-
-1. **Tap Class** (`tap_census/tap.py`): Main entry point, defines streams and configuration
-1. **Client** (`tap_census/client.py`): Handles API communication and authentication
-1. **Streams** (`tap_census/streams.py`): Define data streams and their schemas
-   ## Development Guidelines for AI Agents
-
-### Understanding Singer Concepts
-
-Before making changes, ensure you understand these Singer concepts:
-
-- **Streams**: Individual data endpoints (e.g., users, orders, transactions)
-- **State**: Tracks incremental sync progress using bookmarks
-- **Catalog**: Metadata about available streams and their schemas
-- **Records**: Individual data items emitted by the tap
-- **Schemas**: JSON Schema definitions for stream data
-
-### Common Tasks
-
-#### Adding a New Stream
-
-1. Define stream class in `tap_census/streams.py`
-1. Set `name`, `path`, `primary_keys`, and `replication_key` (set this to `None` if not applicable)
-1. Define schema using `PropertiesList` or JSON Schema
-1. Register stream in the tap's `discover_streams()` method
-
-Example:
-
-```python
-class MyNewStream(CensusStream):
-    name = "my_new_stream"
-    path = "/api/v1/my_resource"
-    primary_keys = ["id"]
-    replication_key = "updated_at"
-
-    schema = PropertiesList(
-        Property("id", StringType, required=True),
-        Property("name", StringType),
-        Property("updated_at", DateTimeType),
-    ).to_dict()
+```
+tap_census/
+├── __init__.py
+├── __main__.py          # TapCensus.cli()
+├── tap.py               # TapCensus class, config schema, stream registration
+├── client.py            # CensusStream base class (RESTStream), retry, rate limiting
+├── helpers.py            # parse_census_array, make_fips, safe_int, safe_float
+└── streams/
+    ├── __init__.py
+    ├── population_streams.py   # PEP + Decennial population streams
+    └── geography_streams.py    # Gazetteer county centroid stream
 ```
 
-#### Modifying Authentication
+### Base Class Hierarchy
 
-- Update `authenticator` in client class
-- API key should be passed via headers or query parameters
-- Configuration defined in `tap.py` config schema
-  #### Handling Pagination
+```
+CensusStream (ABC, RESTStream)       # Rate limiting, backoff retry, 2D array parsing
+├── PepPopulationBaseStream          # Shared PEP logic (vintage routing, date_code vs year_suffix)
+│   ├── CountyPopulationStream       # County PEP (2010-2019 via 2019 vintage)
+│   └── StatePopulationStream        # State PEP (2010-2021 via 2019+2021 vintages)
+└── DecennialPopulationStream        # Decennial county pop (2000, 2010, 2020)
 
-The SDK provides built-in pagination classes. **Use these instead of overriding `get_next_page_token()` directly.**
-
-**Built-in Paginator Classes:**
-
-1. **SimpleHeaderPaginator**: For APIs using Link headers (RFC 5988)
-
-   ```python
-   from singer_sdk.pagination import SimpleHeaderPaginator
-
-   class MyStream(CensusStream):
-       def get_new_paginator(self):
-           return SimpleHeaderPaginator()
-   ```
-
-1. **HeaderLinkPaginator**: For APIs with `Link: <url>; rel="next"` headers
-
-   ```python
-   from singer_sdk.pagination import HeaderLinkPaginator
-
-   class MyStream(CensusStream):
-       def get_new_paginator(self):
-           return HeaderLinkPaginator()
-   ```
-
-1. **JSONPathPaginator**: For cursor/token in response body
-
-   ```python
-   from singer_sdk.pagination import JSONPathPaginator
-
-   class MyStream(CensusStream):
-       def get_new_paginator(self):
-           return JSONPathPaginator("$.pagination.next_token")
-   ```
-
-1. **SinglePagePaginator**: For non-paginated endpoints
-
-   ```python
-   from singer_sdk.pagination import SinglePagePaginator
-
-   class MyStream(CensusStream):
-       def get_new_paginator(self):
-           return SinglePagePaginator()
-   ```
-
-**Creating Custom Paginators:**
-
-For complex pagination logic, create a custom paginator class:
-
-```python
-from singer_sdk.pagination import PageNumberPaginator
-
-class MyCustomPaginator(PageNumberPaginator):
-    def has_more(self, response):
-        """Check if there are more pages."""
-        data = response.json()
-        return data.get("has_more", False)
-
-    def get_next_url(self, response):
-        """Get the next page URL."""
-        data = response.json()
-        if self.has_more(response):
-            return data.get("next_url")
-        return None
-
-# Use in stream
-class MyStream(CensusStream):
-    def get_new_paginator(self):
-        return MyCustomPaginator(start_value=1)
+Stream (base SDK class)
+└── CountyGeographyStream            # Gazetteer zip download, not REST
 ```
 
-**Common Pagination Patterns:**
+### Error Handling
 
-- **Offset-based**: Use `OffsetPaginator`
-- **Page-based**: Use `PageNumberPaginator`
-- **Cursor-based**: Use or extend `JSONPathPaginator`
-- **HATEOAS/HAL**: Extend `BaseHATEOASPaginator` with a custom `get_next_url()` method to extract the next URL from the response.
+- `strict_mode` config (default: `false`): When true, API errors raise exceptions. When false, errors are logged as warnings and the partition is skipped.
+- `_fetch_census_data()` in the base class consolidates the request + error handling pattern.
 
-Only override `get_next_page_token()` as a last resort for very simple cases.
+## Census Bureau API — Verified Facts
 
-#### State and Incremental Sync
+**Everything below was verified via live `curl` calls, NOT from PROMPT.md or assumed.**
 
-- Set `replication_key` to enable incremental sync (e.g., "updated_at")
-- Override `get_starting_timestamp()` to set initial sync point
-- State automatically managed by SDK
-- Access current state via `get_context_state()`
+### PEP Population Estimates (`pep/population`)
 
-#### Schema Evolution
+The PEP API changed its variable naming scheme between vintages:
 
-- Use flexible schemas during development
-- Add new properties without breaking changes
-- Consider making fields optional when unsure
-- Use `th.Property("field", th.StringType)` for basic types
-- Nest objects with `th.ObjectType(...)`
+| Vintage | Date Variable | Name Variable | County Support | Years Covered |
+|---------|--------------|---------------|----------------|---------------|
+| 2015 | `DATE_` | `GEONAME` | Yes | 2010-2015 |
+| 2016-2017 | `DATE_` | `GEONAME` | Yes | 2010-vintage year |
+| 2018 | `DATE_CODE` | `GEONAME` | Yes | 2010-2018 |
+| 2019 | `DATE_CODE` | `NAME` | Yes | 2010-2019 |
+| 2021 | `POP_{year}`, `DENSITY_{year}` | `NAME` | **NO** (state only) | 2020-2021 |
+| 2022-2023 | N/A | N/A | N/A | **DO NOT EXIST** |
 
-### Testing
+**DATE_CODE mapping (2019 vintage):** `DATE_CODE = year - 2007` (e.g., 2019 → 12, 2015 → 8, 2010 → 3).
 
-Run tests to verify your changes:
+**Current implementation uses the 2019 vintage** for all county/state data (2010-2019) because it has the most consistent variable names (`DATE_CODE`, `NAME`) and broadest geography support.
 
-```bash
-# Install dependencies
-uv sync
+### PEP Characteristics (`pep/charv`) — 2023 Vintage
 
-# Run all tests
-uv run pytest
+A newer endpoint that provides county-level population for 2020-2023:
+- Variables: `POP`, `YEAR`, `MONTH`, `AGE`, `SEX`, `HISP`, `NAME`
+- Filter for total population: `AGE=0000&SEX=0&HISP=0`
+- County support: **Yes** (3,222 counties confirmed)
+- No `DENSITY` variable available
+- **Not yet implemented** — should be added to cover 2020-2023 county data gap.
 
-# Run specific test
-uv run pytest tests/test_core.py -k test_name
-```
+### Decennial Census
 
-### Configuration
+| Year | Endpoint | Pop Variable | Verified |
+|------|----------|-------------|----------|
+| 2000 | `/2000/dec/sf1` | `P001001` | Yes |
+| 2010 | `/2010/dec/sf1` | `P001001` | Yes |
+| 2020 | `/2020/dec/pl` | `P1_001N` | Yes |
 
-Configuration properties are defined in the tap class:
+### PEP Housing (`pep/housing`) — 2013-2019 Vintages
 
-- Required vs optional properties
-- Secret properties (passwords, tokens)
-- Mark sensitive data with `secret=True` parameter
-- Defaults specified in config schema
+- Variables: `HUEST` (housing unit estimate), `DATE_CODE`
+- County support: Yes
+- **Not yet implemented.**
 
-Example configuration schema:
+### County Geography (Gazetteer)
 
-```python
-from singer_sdk import typing as th
+- Source: `https://www2.census.gov/geo/docs/maps-data/data/gazetteer/2020_Gazetteer/2020_Gaz_counties_national.zip`
+- Format: Tab-delimited text inside a zip archive
+- Columns: `USPS, GEOID, ANSICODE, NAME, ALAND, AWATER, ALAND_SQMI, AWATER_SQMI, INTPTLAT, INTPTLONG`
+- The 2023 Gazetteer URL pattern (`2023_Gazetteer/...`) returns **404**. Only 2020 is confirmed available.
 
-config_jsonschema = th.PropertiesList(
-    th.Property("api_url", th.StringType, required=True),
-    th.Property("api_key", th.StringType, required=True, secret=True),
-    th.Property("start_date", th.DateTimeType),
-).to_dict()
-```
+### Census API Quirks
 
-Example test with config:
+- Returns **2D arrays** (first row = headers, subsequent rows = data), NOT JSON objects.
+- **All values are strings**, even numbers. Always cast.
+- Returns `"null"` as the literal string `"null"`, not JSON null.
+- FIPS codes are **zero-padded strings** ("06" not 6, "037" not 37).
+- Variable names and geography support **change between vintages** — always verify.
+- API key is passed as a query parameter (`&key=YOUR_KEY`), not a header.
 
-```bash
-tap-census --config config.json --discover
-tap-census --config config.json --catalog catalog.json
-```
+## Meltano / Singer SDK Patterns
 
-### Keeping meltano.yml and Tap Settings in Sync
+### Keeping Config in Sync
 
-When this tap is used with Meltano, the settings defined in `meltano.yml` must stay in sync with the `config_jsonschema` in the tap class. Configuration drift between these two sources causes confusion and runtime errors.
+When adding/changing settings, update all three in the same commit:
+1. `config_jsonschema` in `tap_census/tap.py`
+2. `settings` block in `meltano.yml`
+3. Environment variables in `.env.example`
 
-**When to sync:**
-
-- Adding new configuration properties to the tap
-- Removing or renaming existing properties
-- Changing property types, defaults, or descriptions
-- Marking properties as required or secret
-
-**How to sync:**
-
-1. Update `config_jsonschema` in `tap_census/tap.py`
-1. Update the corresponding `settings` block in `meltano.yml`
-1. Update `.env.example` with the new environment variable
-
-Example - adding a new `batch_size` setting:
-
-```python
-# tap_census/tap.py
-config_jsonschema = th.PropertiesList(
-    th.Property("api_url", th.StringType, required=True),
-    th.Property("api_key", th.StringType, required=True, secret=True),
-    th.Property("batch_size", th.IntegerType, default=100),  # New setting
-).to_dict()
-```
-
-```yaml
-# meltano.yml
-plugins:
-  extractors:
-    - name: tap-census
-      settings:
-        - name: api_url
-          kind: string
-        - name: api_key
-          kind: string
-          sensitive: true
-        - name: batch_size  # New setting
-          kind: integer
-          value: 100
-```
-
-```bash
-# .env.example
-TAP_CENSUS_API_URL=https://api.example.com
-TAP_CENSUS_API_KEY=your_api_key_here
-TAP_CENSUS_BATCH_SIZE=100  # New setting
-```
-
-**Setting kind mappings:**
+### Setting Kind Mappings
 
 | Python Type | Meltano Kind |
 |-------------|--------------|
@@ -261,84 +136,21 @@ TAP_CENSUS_BATCH_SIZE=100  # New setting
 | `NumberType` | `number` |
 | `DateTimeType` | `date_iso8601` |
 | `ArrayType` | `array` |
-| `ObjectType` | `object` |
 
-Any properties with `secret=True` should be marked with `sensitive: true` in `meltano.yml`.
+Properties with `secret=True` → `sensitive: true` in meltano.yml.
 
-**Best practices:**
+## Code Style
 
-- Always update all three files (`tap.py`, `meltano.yml`, `.env.example`) in the same commit
-- Use the same default values in all locations
-- Keep descriptions consistent between code docstrings and `meltano.yml` `description` fields
+- **DRY / SOLID**: Extract shared logic into base classes (e.g., `PepPopulationBaseStream`). Consolidate duplicate patterns (e.g., `_safe_cast` for int/float conversion, `_fetch_census_data` for request + error handling).
+- **Self-documenting names**: `requires_county_geography`, `transform_census_record_to_output`, `get_geography_params`.
+- **Minimal loops**: Only use `for`/`while` when necessary. Prefer list comprehensions and generators.
+- **Use UV** for all Python execution (`uv sync`, `uv run pytest`, etc.).
 
-> **Note:** This guidance is consistent with target and mapper templates in the Singer SDK. See the [SDK documentation](https://sdk.meltano.com) for canonical reference.
+## Not Yet Implemented
 
-### Common Pitfalls
+These are confirmed available in the Census API but not yet built:
 
-1. **Rate Limiting**: Implement backoff using `RESTStream` built-in retry logic
-1. **Large Responses**: Use pagination, don't load entire dataset into memory
-1. **Schema Mismatches**: Validate data matches schema, handle null values
-1. **State Management**: Don't modify state directly, use SDK methods
-1. **Timezone Handling**: Use UTC, parse ISO 8601 datetime strings
-1. **Error Handling**: Let SDK handle retries, log warnings for data issues
-
-### SDK Resources
-
-- [Singer SDK Documentation](https://sdk.meltano.com)
-- [Singer Spec](https://hub.meltano.com/singer/spec)
-- [SDK Reference](https://sdk.meltano.com/en/latest/reference.html)
-- [Stream Maps](https://sdk.meltano.com/en/latest/stream_maps.html)
-
-### Best Practices
-
-1. **Logging**: Use `self.logger` for structured logging
-1. **Validation**: Validate API responses before emitting records
-1. **Documentation**: Update README with new streams and config options
-1. **Type Hints**: Add type hints to improve code clarity
-1. **Testing**: Write tests for new streams and edge cases
-1. **Performance**: Profile slow streams, optimize API calls
-1. **Error Messages**: Provide clear, actionable error messages
-
-## File Structure
-
-```
-tap-census/
-├── tap_census/
-│   ├── __init__.py
-│   ├── tap.py          # Main tap class
-│   ├── client.py       # API client
-│   └── streams.py      # Stream definitions
-├── tests/
-│   ├── __init__.py
-│   └── test_core.py
-├── config.json         # Example configuration
-├── pyproject.toml      # Dependencies and metadata
-└── README.md          # User documentation
-```
-
-## Additional Resources
-
-- Project README: See `README.md` for setup and usage
-- Singer SDK: https://sdk.meltano.com
-- Meltano: https://meltano.com
-- Singer Specification: https://hub.meltano.com/singer/spec
-
-## Making Changes
-
-When implementing changes:
-
-1. Understand the existing code structure
-1. Follow Singer and SDK patterns
-1. Test thoroughly with real API credentials
-1. Update documentation and docstrings
-1. Ensure backward compatibility when possible
-1. Run linting and type checking
-
-## Questions?
-
-If you're uncertain about an implementation:
-
-- Check SDK documentation for similar examples
-- Review other Singer taps for patterns
-- Test incrementally with small changes
-- Validate against the Singer specification
+- `pep/charv` (2023 vintage): County population 2020-2023 — fills the gap where `pep/population` 2021 vintage lacks county geography.
+- `pep/housing` (2013-2019 vintages): Housing unit estimates at county level.
+- `pep/components` (2015-2019 vintages): Components of change (births, deaths, migration).
+- ACS endpoints: Detailed demographics, housing characteristics. Lower priority.
