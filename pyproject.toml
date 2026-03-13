@@ -72,16 +72,13 @@ addopts = [
 filterwarnings = [
     "error",
     "once:No records were available to test:UserWarning",
+    # backoff uses asyncio.iscoroutinefunction, deprecated in 3.14
+    "ignore:.*asyncio.iscoroutinefunction.*:DeprecationWarning",
 ]
 log_level = "INFO"
 minversion = "9.0"
 testpaths = [
     "tests",
-]
-filterwarnings = [
-    "error",
-    # backoff uses asyncio.iscoroutinefunction, deprecated in 3.14
-    "ignore:.*asyncio.iscoroutinefunction.*:DeprecationWarning",
 ]
 xfail_strict = true
 
