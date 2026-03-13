@@ -6,6 +6,9 @@ API documentation verified against live Census Bureau endpoints:
   DATE_CODE mapping: year 2010 -> 3, 2011 -> 4, ..., 2019 -> 12.
 - PEP 2021 vintage: /data/2021/pep/population (variables: POP_{year}, DENSITY_{year}, NAME)
   Covers years 2020-2021 at state level ONLY (no county geography).
+- PEP charv 2023 vintage: /data/2023/pep/charv (variables: POP, YEAR, MONTH, NAME)
+  Covers years 2020-2023 at county AND state level. No DENSITY variable.
+  Predicates: AGE=0000, SEX=0, HISP=0, MONTH=7 for total July population.
 - Decennial 2000/2010: /data/{year}/dec/sf1 (variable: P001001)
 - Decennial 2020: /data/2020/dec/pl (variable: P1_001N)
 """
@@ -18,7 +21,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 from singer_sdk import typing as th
 
 from tap_census.client import CensusStream
-from tap_census.helpers import make_fips, safe_float, safe_int
+from tap_census.helpers import safe_float, safe_int
 
 if sys.version_info >= (3, 12):
     from typing import override
@@ -51,7 +54,7 @@ PEP_VINTAGES: dict[int, dict[str, Any]] = {
 }
 
 
-def _find_vintage(year: int, need_county: bool) -> int | None:
+def _find_vintage(year: int, *, need_county: bool) -> int | None:
     """Find the appropriate PEP vintage for a given year and geography need."""
     for vintage, meta in PEP_VINTAGES.items():
         if year in meta["years"] and (not need_county or meta["supports_county"]):
@@ -62,20 +65,15 @@ def _find_vintage(year: int, need_county: bool) -> int | None:
 def _build_pep_params(
     vintage: int,
     year: int,
-    geo_for: str,
-    geo_in: str | None,
-    api_key: str | None,
 ) -> tuple[str, dict[str, Any]]:
-    """Build the URL and query params for a PEP API request."""
+    """Build the URL and vintage-specific query params for a PEP API request.
+
+    Geography and API key are injected separately via base class helpers.
+    """
     meta = PEP_VINTAGES[vintage]
     url = f"https://api.census.gov/data/{vintage}/pep/population"
 
-    params: dict[str, Any] = {"for": geo_for}
-    if geo_in:
-        params["in"] = geo_in
-    if api_key:
-        params["key"] = api_key
-
+    params: dict[str, Any] = {}
     if meta["variable_style"] == "date_code":
         params["get"] = "POP,DENSITY,NAME"
         params["DATE_CODE"] = str(year - 2007)
@@ -86,7 +84,9 @@ def _build_pep_params(
 
 
 def _extract_pop_density(
-    record: dict[str, str], vintage: int, year: int,
+    record: dict[str, str],
+    vintage: int,
+    year: int,
 ) -> tuple[int | None, float | None]:
     """Extract population and density from a parsed Census record."""
     if PEP_VINTAGES[vintage]["variable_style"] == "date_code":
@@ -101,34 +101,25 @@ def _extract_pop_density(
 # Base PEP stream — eliminates duplication between County and State streams
 # ---------------------------------------------------------------------------
 
+
 class PepPopulationBaseStream(CensusStream):
     """Shared logic for PEP population streams (Single Responsibility).
 
-    Subclasses define requires_county_geography, get_geography_params, and transform_census_record_to_output
-    to customize for county vs. state geography.
+    Subclasses set ``requires_county_geography`` and override
+    ``_transform_pep_record`` to customize for county vs. state geography.
     """
 
-    requires_county_geography: ClassVar[bool]
-
-    @property
-    def path(self) -> str:
-        """Not used — requests are built in get_records."""
-        return ""
+    path = ""
 
     @property
     def partitions(self) -> list[dict[str, Any]]:
         """One partition per configured year that has available PEP data."""
-        default = [2015, 2016, 2017, 2018, 2019, 2020, 2021]
+        default = [2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023]
         years = self.config.get("years", default)
-        return [{"year": y} for y in years if _find_vintage(y, self.requires_county_geography)]
+        need_county = self.requires_county_geography
+        return [{"year": y} for y in years if _find_vintage(y, need_county=need_county)]
 
-    def get_geography_params(self) -> tuple[str, str | None]:
-        """Return (geo_for, geo_in) clauses. Overridden by subclasses."""
-        raise NotImplementedError
-
-    def transform_census_record_to_output(
-        self, record: dict, year: int, vintage: int,
-    ) -> dict:
+    def _transform_pep_record(self, record: dict, year: int, vintage: int) -> dict:
         """Transform a parsed Census record to the output schema."""
         raise NotImplementedError
 
@@ -139,34 +130,39 @@ class PepPopulationBaseStream(CensusStream):
             return
 
         year = context["year"]
-        vintage = _find_vintage(year, self.requires_county_geography)
+        vintage = _find_vintage(year, need_county=self.requires_county_geography)
         if vintage is None:
             self.logger.warning("No PEP vintage for year %d, skipping", year)
             return
 
-        geo_for, geo_in = self.get_geography_params()
-        api_key = self.config.get("api_key")
-        url, params = _build_pep_params(vintage, year, geo_for, geo_in, api_key)
+        url, params = _build_pep_params(vintage, year)
+        self._inject_geography(params)
+        self._inject_api_key(params)
 
         records = self._fetch_census_data(
-            url, params, f"PEP population year={year} vintage={vintage}",
+            url,
+            params,
+            f"PEP population year={year} vintage={vintage}",
         )
         if not records:
             return
 
-        for record in records:
-            yield self.transform_census_record_to_output(record, year, vintage)
+        yield from self._yield_with_schema_check(
+            records,
+            lambda r: self._transform_pep_record(r, year, vintage),
+        )
 
 
 # ---------------------------------------------------------------------------
 # Concrete PEP streams
 # ---------------------------------------------------------------------------
 
+
 class CountyPopulationStream(PepPopulationBaseStream):
     """County-level population estimates from PEP (2010-2019).
 
     County PEP data is only available from the 2019 vintage.
-    For 2020 county population, use DecennialPopulationStream.
+    For 2020+ county population, use CountyPopulationCharvStream.
     """
 
     name = "county_population"
@@ -184,26 +180,14 @@ class CountyPopulationStream(PepPopulationBaseStream):
         th.Property("density", th.NumberType),
     ).to_dict()
 
-    def get_geography_params(self) -> tuple[str, str | None]:
-        states = self.config.get("states", ["*"])
-        geo_in = "state:*" if states == ["*"] else f"state:{','.join(states)}"
-        return "county:*", geo_in
-
-    def transform_census_record_to_output(
-        self, record: dict, year: int, vintage: int,
-    ) -> dict:
-        state_fips = record.get("state", "")
-        county_fips = record.get("county", "")
+    def _transform_pep_record(self, record: dict, year: int, vintage: int) -> dict:
         pop, density = _extract_pop_density(record, vintage, year)
-        return {
-            "year": year,
-            "state_fips": state_fips,
-            "county_fips": county_fips,
-            "fips": make_fips(state_fips, county_fips),
-            "name": record.get("name"),
-            "population": pop,
-            "density": density,
-        }
+        return self._build_county_record(
+            record,
+            year,
+            population=pop,
+            density=density,
+        )
 
 
 class StatePopulationStream(PepPopulationBaseStream):
@@ -225,22 +209,14 @@ class StatePopulationStream(PepPopulationBaseStream):
         th.Property("density", th.NumberType),
     ).to_dict()
 
-    def get_geography_params(self) -> tuple[str, str | None]:
-        states = self.config.get("states", ["*"])
-        geo_for = "state:*" if states == ["*"] else f"state:{','.join(states)}"
-        return geo_for, None
-
-    def transform_census_record_to_output(
-        self, record: dict, year: int, vintage: int,
-    ) -> dict:
+    def _transform_pep_record(self, record: dict, year: int, vintage: int) -> dict:
         pop, density = _extract_pop_density(record, vintage, year)
-        return {
-            "year": year,
-            "state_fips": record.get("state", ""),
-            "name": record.get("name"),
-            "population": pop,
-            "density": density,
-        }
+        return self._build_state_record(
+            record,
+            year,
+            population=pop,
+            density=density,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +244,7 @@ class DecennialPopulationStream(CensusStream):
     name = "decennial_population"
     primary_keys: ClassVar[tuple[str, ...]] = ("year", "fips")
     replication_key = None
+    requires_county_geography: ClassVar[bool] = True
 
     schema = th.PropertiesList(
         th.Property("year", th.IntegerType, required=True),
@@ -278,10 +255,7 @@ class DecennialPopulationStream(CensusStream):
         th.Property("population", th.IntegerType),
     ).to_dict()
 
-    @property
-    def path(self) -> str:
-        """Not used — requests are built in get_records."""
-        return ""
+    path = ""
 
     @property
     def partitions(self) -> list[dict[str, Any]]:
@@ -303,32 +277,159 @@ class DecennialPopulationStream(CensusStream):
         pop_var = endpoint["pop_var"]
         url = f"{self.url_base}/{endpoint['path']}"
 
-        params: dict[str, Any] = {
-            "get": f"{pop_var},NAME",
-            "for": "county:*",
-            "in": "state:*",
-        }
-        api_key = self.config.get("api_key")
-        if api_key:
-            params["key"] = api_key
-        states = self.config.get("states", ["*"])
-        if states != ["*"]:
-            params["in"] = f"state:{','.join(states)}"
+        params: dict[str, Any] = {"get": f"{pop_var},NAME"}
+        self._inject_geography(params)
+        self._inject_api_key(params)
 
         records = self._fetch_census_data(
-            url, params, f"decennial population year={year}",
+            url,
+            params,
+            f"decennial population year={year}",
         )
         if not records:
             return
 
-        for record in records:
-            state_fips = record.get("state", "")
-            county_fips = record.get("county", "")
-            yield {
-                "year": year,
-                "state_fips": state_fips,
-                "county_fips": county_fips,
-                "fips": make_fips(state_fips, county_fips),
-                "name": record.get("name"),
-                "population": safe_int(record.get(pop_var.lower())),
-            }
+        pop_key = pop_var.lower()
+        yield from self._yield_with_schema_check(
+            records,
+            lambda r: self._build_county_record(
+                r,
+                year,
+                population=safe_int(r.get(pop_key)),
+            ),
+        )
+
+
+# ---------------------------------------------------------------------------
+# PEP Population Characteristics (charv) — 2023 vintage
+# ---------------------------------------------------------------------------
+# Verified via live API calls:
+#   GET /data/2023/pep/charv?get=POP,NAME&for=county:013&in=state:04
+#       &AGE=0000&SEX=0&HISP=0&YEAR=2023&MONTH=7
+#   GET /data/2023/pep/charv?get=POP,NAME&for=state:04
+#       &AGE=0000&SEX=0&HISP=0&YEAR=2023&MONTH=7
+# Variables: POP (int), YEAR (string), MONTH (string), NAME (string)
+# Predicates: AGE=0000, SEX=0, HISP=0 for total population; MONTH=7 for
+#   July estimates (MONTH=4 is the April 1 Census base, only for 2020).
+# County support: YES (verified with 3,222 counties).
+# State support: YES (verified).
+# Years: 2020-2023. Only the 2023 vintage exists (2020-2022 return 404).
+# Note: No DENSITY variable available in charv.
+
+CHARV_VINTAGE = 2023
+CHARV_YEARS = range(2020, 2024)
+
+
+class PepCharvBaseStream(CensusStream):
+    """Base stream for PEP population characteristics (charv) 2020-2023.
+
+    Uses the 2023 pep/charv endpoint which provides county-level population
+    for 2020-2023, filling the gap where pep/population 2021 vintage lacks
+    county geography. Filters for total population (AGE=0000, SEX=0, HISP=0)
+    and July estimates (MONTH=7).
+    """
+
+    path = ""
+
+    @property
+    def partitions(self) -> list[dict[str, Any]]:
+        """One partition per configured year within charv range (2020-2023)."""
+        default = [2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023]
+        years = self.config.get("years", default)
+        return [{"year": y} for y in years if y in CHARV_YEARS]
+
+    def _transform_charv_record(self, record: dict, year: int) -> dict:
+        """Transform a parsed charv record to the output schema."""
+        raise NotImplementedError
+
+    @override
+    def get_records(self, context: Context | None) -> Iterable[dict]:
+        """Fetch charv population for a single year partition."""
+        if context is None:
+            return
+
+        year = context["year"]
+        if year not in CHARV_YEARS:
+            return
+
+        url = f"{self.url_base}/{CHARV_VINTAGE}/pep/charv"
+        params: dict[str, Any] = {
+            "get": "POP,NAME",
+            "AGE": "0000",
+            "SEX": "0",
+            "HISP": "0",
+            "YEAR": str(year),
+            "MONTH": "7",
+        }
+        self._inject_geography(params)
+        self._inject_api_key(params)
+
+        records = self._fetch_census_data(
+            url,
+            params,
+            f"charv population year={year}",
+        )
+        if not records:
+            return
+
+        yield from self._yield_with_schema_check(
+            records,
+            lambda r: self._transform_charv_record(r, year),
+        )
+
+
+class CountyPopulationCharvStream(PepCharvBaseStream):
+    """County-level population from PEP characteristics (2020-2023).
+
+    Fills the county population gap for 2020-2023 where the pep/population
+    2021 vintage only supports state-level geography.
+    Note: No density data available from this endpoint.
+    """
+
+    name = "county_population_charv"
+    primary_keys: ClassVar[tuple[str, ...]] = ("year", "fips")
+    replication_key = None
+    requires_county_geography: ClassVar[bool] = True
+
+    schema = th.PropertiesList(
+        th.Property("year", th.IntegerType, required=True),
+        th.Property("state_fips", th.StringType, required=True),
+        th.Property("county_fips", th.StringType, required=True),
+        th.Property("fips", th.StringType, required=True),
+        th.Property("name", th.StringType),
+        th.Property("population", th.IntegerType),
+    ).to_dict()
+
+    def _transform_charv_record(self, record: dict, year: int) -> dict:
+        return self._build_county_record(
+            record,
+            year,
+            population=safe_int(record.get("pop")),
+        )
+
+
+class StatePopulationCharvStream(PepCharvBaseStream):
+    """State-level population from PEP characteristics (2020-2023).
+
+    Note: No density data available from this endpoint. For 2020-2021 state
+    population with density, use StatePopulationStream (pep/population 2021 vintage).
+    """
+
+    name = "state_population_charv"
+    primary_keys: ClassVar[tuple[str, ...]] = ("year", "state_fips")
+    replication_key = None
+    requires_county_geography: ClassVar[bool] = False
+
+    schema = th.PropertiesList(
+        th.Property("year", th.IntegerType, required=True),
+        th.Property("state_fips", th.StringType, required=True),
+        th.Property("name", th.StringType),
+        th.Property("population", th.IntegerType),
+    ).to_dict()
+
+    def _transform_charv_record(self, record: dict, year: int) -> dict:
+        return self._build_state_record(
+            record,
+            year,
+            population=safe_int(record.get("pop")),
+        )

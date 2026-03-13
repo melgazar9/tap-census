@@ -24,13 +24,13 @@ plugins:
         description: Base URL for the Census Bureau API
       - name: years
         kind: array
-        description: Which years to pull population estimates for
+        description: "Which years to pull data for (PEP: 2010-2019/2021, charv: 2020-2023, housing: 2010-2019, decennial: 2000/2010/2020)"
       - name: geography_levels
         kind: array
         description: "Geographic levels to extract: county, state"
       - name: datasets
         kind: array
-        description: "Datasets to extract: pep, decennial"
+        description: "Datasets to extract: pep, charv, decennial, housing"
       - name: states
         kind: array
         description: 'State FIPS codes to filter by. ["*"] = all states'
@@ -42,16 +42,24 @@ plugins:
         kind: boolean
         value: false
         description: If true, raise exceptions on API errors instead of skipping
+      - name: gazetteer_year
+        kind: integer
+        value: 2024
+        description: "Gazetteer year for county geography. Available: 2020-2025. Use 2024+ for CT planning regions."
     select:
       - county_population.*
       - state_population.*
+      - county_population_charv.*
+      - state_population_charv.*
       - decennial_population.*
+      - county_housing_units.*
+      - state_housing_units.*
       - county_geography.*
     config:
       api_key: ${CENSUS_API_KEY}
-      years: [2015, 2016, 2017, 2018, 2019, 2020, 2021]
+      years: [2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023]
       geography_levels: ["county", "state"]
-      datasets: ["pep", "decennial"]
+      datasets: ["pep", "charv", "decennial", "housing"]
       states: ["*"]
 
   loaders:

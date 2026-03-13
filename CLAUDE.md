@@ -10,7 +10,7 @@ This file provides guidance to Claude Code when working with code in this reposi
 
 ## What This Is
 
-A Meltano Singer tap for the U.S. Census Bureau API. Extracts population estimates, decennial census counts, and county geography (lat/lon centroids) for use in population-weighted energy demand forecasting (HDD/CDD). Built with the [Meltano Singer SDK](https://sdk.meltano.com).
+A Meltano Singer tap for the U.S. Census Bureau API. Extracts population estimates, decennial census counts, housing unit estimates, and county geography (lat/lon centroids) for use in population-weighted energy demand forecasting (HDD/CDD). Built with the [Meltano Singer SDK](https://sdk.meltano.com).
 
 ## Build & Test Commands
 
@@ -31,21 +31,31 @@ tap_census/
 ├── __init__.py
 ├── __main__.py          # TapCensus.cli()
 ├── tap.py               # TapCensus class, config schema, stream registration
-├── client.py            # CensusStream base class (RESTStream), retry, rate limiting
-├── helpers.py            # parse_census_array, make_fips, safe_int, safe_float
+├── client.py            # CensusStream base class (RESTStream), retry, rate limiting,
+│                        #   shared geography/record helpers
+├── helpers.py           # parse_census_array, make_fips, safe_int, safe_float
 └── streams/
     ├── __init__.py
-    ├── population_streams.py   # PEP + Decennial population streams
+    ├── population_streams.py   # PEP, charv, and Decennial population streams
+    ├── housing_streams.py      # PEP housing unit estimate streams
     └── geography_streams.py    # Gazetteer county centroid stream
 ```
 
 ### Base Class Hierarchy
 
 ```
-CensusStream (ABC, RESTStream)       # Rate limiting, backoff retry, 2D array parsing
+CensusStream (ABC, RESTStream)       # Rate limiting, backoff retry, 2D array parsing,
+│                                    # shared: _build_geography_params, _build_county_record,
+│                                    # _build_state_record, _inject_api_key, _inject_geography
 ├── PepPopulationBaseStream          # Shared PEP logic (vintage routing, date_code vs year_suffix)
 │   ├── CountyPopulationStream       # County PEP (2010-2019 via 2019 vintage)
 │   └── StatePopulationStream        # State PEP (2010-2021 via 2019+2021 vintages)
+├── PepCharvBaseStream               # Shared charv logic (AGE/SEX/HISP/MONTH predicates)
+│   ├── CountyPopulationCharvStream  # County charv (2020-2023)
+│   └── StatePopulationCharvStream   # State charv (2020-2023)
+├── HousingUnitsBaseStream           # Shared housing logic (DATE_CODE filtering)
+│   ├── CountyHousingUnitsStream     # County housing (2010-2019)
+│   └── StateHousingUnitsStream      # State housing (2010-2019)
 └── DecennialPopulationStream        # Decennial county pop (2000, 2010, 2020)
 
 Stream (base SDK class)
@@ -56,6 +66,13 @@ Stream (base SDK class)
 
 - `strict_mode` config (default: `false`): When true, API errors raise exceptions. When false, errors are logged as warnings and the partition is skipped.
 - `_fetch_census_data()` in the base class consolidates the request + error handling pattern.
+
+### DRY Patterns (following tap-fred)
+
+- `_build_geography_params()` — single implementation of county vs state geography logic, driven by `requires_county_geography` class var
+- `_build_county_record()` / `_build_state_record()` — shared record construction with FIPS code assembly
+- `_inject_api_key()` / `_inject_geography()` — shared param injection
+- Base stream classes (`PepPopulationBaseStream`, `PepCharvBaseStream`, `HousingUnitsBaseStream`) handle partition/fetch logic; concrete streams only implement transform methods
 
 ## Census Bureau API — Verified Facts
 
@@ -78,14 +95,18 @@ The PEP API changed its variable naming scheme between vintages:
 
 **Current implementation uses the 2019 vintage** for all county/state data (2010-2019) because it has the most consistent variable names (`DATE_CODE`, `NAME`) and broadest geography support.
 
-### PEP Characteristics (`pep/charv`) — 2023 Vintage
+### PEP Characteristics (`pep/charv`) — 2023 Vintage (**IMPLEMENTED**)
 
-A newer endpoint that provides county-level population for 2020-2023:
+Provides county- and state-level population for 2020-2023:
 - Variables: `POP`, `YEAR`, `MONTH`, `AGE`, `SEX`, `HISP`, `NAME`
 - Filter for total population: `AGE=0000&SEX=0&HISP=0`
+- Filter for July estimates: `MONTH=7` (MONTH=4 is April Census base, 2020 only)
 - County support: **Yes** (3,222 counties confirmed)
+- State support: **Yes**
 - No `DENSITY` variable available
-- **Not yet implemented** — should be added to cover 2020-2023 county data gap.
+- Only the 2023 vintage exists (2020, 2021, 2022 vintages return **404**)
+- Predicate variables are echoed as response columns (YEAR, MONTH, AGE, SEX, HISP)
+- Implemented as `county_population_charv` and `state_population_charv` streams
 
 ### Decennial Census
 
@@ -95,11 +116,19 @@ A newer endpoint that provides county-level population for 2020-2023:
 | 2010 | `/2010/dec/sf1` | `P001001` | Yes |
 | 2020 | `/2020/dec/pl` | `P1_001N` | Yes |
 
-### PEP Housing (`pep/housing`) — 2013-2019 Vintages
+### PEP Housing (`pep/housing`) — 2019 Vintage (**IMPLEMENTED**)
 
-- Variables: `HUEST` (housing unit estimate), `DATE_CODE`
-- County support: Yes
-- **Not yet implemented.**
+- Variables: `HUEST` (housing unit estimate), `DATE_CODE`, `NAME`
+- County support: **Yes** (verified)
+- State support: **Yes** (verified)
+- DATE_CODE mapping (same as PEP population):
+  - DATE_CODE 1 = 4/1/2010 Census count (skipped)
+  - DATE_CODE 2 = 4/1/2010 estimates base (skipped)
+  - DATE_CODE 3-12 = 7/1/2010 through 7/1/2019 estimates
+  - Formula: `DATE_CODE = year - 2007` for July estimates
+- Vintages 2013-2019 confirmed available (200). 2020+ return **404**.
+- Implementation uses 2019 vintage only (covers all years 2010-2019).
+- Implemented as `county_housing_units` and `state_housing_units` streams
 
 ### County Geography (Gazetteer)
 
@@ -116,6 +145,7 @@ A newer endpoint that provides county-level population for 2020-2023:
 - FIPS codes are **zero-padded strings** ("06" not 6, "037" not 37).
 - Variable names and geography support **change between vintages** — always verify.
 - API key is passed as a query parameter (`&key=YOUR_KEY`), not a header.
+- **Predicate echo**: When using predicates (e.g., `YEAR=2023`), the API echoes predicate variables as response columns even if not in `get`. Avoid including the same variable in both `get` and as a predicate to prevent duplicate headers.
 
 ## Meltano / Singer SDK Patterns
 
@@ -141,8 +171,8 @@ Properties with `secret=True` → `sensitive: true` in meltano.yml.
 
 ## Code Style
 
-- **DRY / SOLID**: Extract shared logic into base classes (e.g., `PepPopulationBaseStream`). Consolidate duplicate patterns (e.g., `_safe_cast` for int/float conversion, `_fetch_census_data` for request + error handling).
-- **Self-documenting names**: `requires_county_geography`, `transform_census_record_to_output`, `get_geography_params`.
+- **DRY / SOLID**: Extract shared logic into base classes (e.g., `CensusStream._build_geography_params()`, `PepPopulationBaseStream`). Consolidate duplicate patterns (e.g., `_safe_cast` for int/float conversion, `_fetch_census_data` for request + error handling, `_build_county_record` / `_build_state_record` for record construction).
+- **Self-documenting names**: `requires_county_geography`, `_transform_pep_record`, `_build_geography_params`.
 - **Minimal loops**: Only use `for`/`while` when necessary. Prefer list comprehensions and generators.
 - **Use UV** for all Python execution (`uv sync`, `uv run pytest`, etc.).
 
@@ -150,7 +180,5 @@ Properties with `secret=True` → `sensitive: true` in meltano.yml.
 
 These are confirmed available in the Census API but not yet built:
 
-- `pep/charv` (2023 vintage): County population 2020-2023 — fills the gap where `pep/population` 2021 vintage lacks county geography.
-- `pep/housing` (2013-2019 vintages): Housing unit estimates at county level.
-- `pep/components` (2015-2019 vintages): Components of change (births, deaths, migration).
-- ACS endpoints: Detailed demographics, housing characteristics. Lower priority.
+- `pep/components` (2015-2019 vintages): Components of change (births, deaths, migration). Not yet verified via live API calls.
+- ACS endpoints: Detailed demographics, housing characteristics. Lower priority. Not yet verified.

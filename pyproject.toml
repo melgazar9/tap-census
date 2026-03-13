@@ -105,6 +105,16 @@ ignore = [
 ]
 select = ["ALL"]
 
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = [
+    "D",       # docstrings not required in tests
+    "S101",    # assert is standard pytest
+    "PLR2004", # magic values are fine in test assertions
+]
+"validate_endpoints.py" = [
+    "T201",    # print is expected in CLI scripts
+]
+
 [tool.ruff.lint.flake8-annotations]
 allow-star-arg-any = true
 

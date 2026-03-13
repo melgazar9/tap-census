@@ -52,10 +52,11 @@ def parse_census_array(data: list[list[str]]) -> list[dict]:
     Returns:
         List of dictionaries with lowercased, underscore-separated keys.
     """
-    if not data or len(data) < 2:
+    min_rows = 2
+    if not data or len(data) < min_rows:
         return []
     headers = [h.lower().replace(" ", "_") for h in data[0]]
-    return [dict(zip(headers, row)) for row in data[1:]]
+    return [dict(zip(headers, row, strict=False)) for row in data[1:]]
 
 
 def make_fips(state_fips: str, county_fips: str) -> str:

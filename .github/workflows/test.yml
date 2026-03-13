@@ -62,6 +62,26 @@ jobs:
       run: |
         uvx --with=tox-uv tox -e ${{ matrix.python-version }}
 
+  integration:
+    name: Integration (API)
+    needs: [build-package]
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+    - name: Set up Python
+      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      with:
+        python-version: 3.x
+    - name: Setup uv
+      uses: astral-sh/setup-uv@eac588ad8def6316056a12d4907a9d4d84ff7a3b # v7.3.0
+    - name: Run integration tests
+      env:
+        CENSUS_API_KEY: ${{ secrets.CENSUS_API_KEY }}
+      run: |
+        uv sync
+        uv run pytest tests/ -v
+
   typing:
     name: Type Checking
     runs-on: ubuntu-latest

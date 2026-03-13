@@ -1,13 +1,15 @@
 """Geography reference streams for Census Bureau data.
 
-The county geography data is sourced from the Census Bureau's 2020 Gazetteer
-files (tab-delimited zip archive). Verified columns from the actual file:
+The county geography data is sourced from the Census Bureau Gazetteer files
+(tab-delimited zip archive). Verified columns from the actual file:
     USPS, GEOID, ANSICODE, NAME, ALAND, AWATER, ALAND_SQMI, AWATER_SQMI,
     INTPTLAT, INTPTLONG
 
-Source URL verified:
-    https://www2.census.gov/geo/docs/maps-data/data/gazetteer/
-    2020_Gazetteer/2020_Gaz_counties_national.zip
+Gazetteer availability verified via live HTTP status checks:
+    2020-2025: ALL return 200 (available).
+    The 2024 Gazetteer has 3,222 counties including the 9 new Connecticut
+    planning regions (FIPS 09110-09190) which replaced the old 8 counties
+    (09001-09015) starting in 2022.
 """
 
 from __future__ import annotations
@@ -35,24 +37,19 @@ if TYPE_CHECKING:
 
     from singer_sdk.helpers.types import Context
 
-# 2020 Gazetteer county file (zip archive containing a tab-delimited txt).
-# Verified via: curl -s -o /dev/null -w "%{http_code}" <url> → 200
-GAZETTEER_ZIP_URL = (
-    "https://www2.census.gov/geo/docs/maps-data/data/gazetteer/"
-    "2020_Gazetteer/2020_Gaz_counties_national.zip"
-)
-GAZETTEER_FILENAME = "2020_Gaz_counties_national.txt"
+GAZETTEER_BASE_URL = "https://www2.census.gov/geo/docs/maps-data/data/gazetteer"
+DEFAULT_GAZETTEER_YEAR = 2024
 
 
 class CountyGeographyStream(Stream):
     """FIPS code reference table mapping counties to lat/lon centroids.
 
-    Sources data from the Census Bureau 2020 Gazetteer files (zip archive
+    Sources data from the Census Bureau Gazetteer files (zip archive
     with a tab-delimited text file). This stream does NOT use the REST API
     and instead inherits from the base Stream class.
 
-    This data is critical for mapping weather grid points to counties
-    for population-weighted calculations.
+    The Gazetteer year is configurable via the ``gazetteer_year`` setting
+    (default: 2024). Available years: 2020-2025.
     """
 
     name = "county_geography"
@@ -69,6 +66,20 @@ class CountyGeographyStream(Stream):
         th.Property("water_area_sqmi", th.NumberType),
     ).to_dict()
 
+    @property
+    def _gazetteer_year(self) -> int:
+        return self.config.get("gazetteer_year", DEFAULT_GAZETTEER_YEAR)
+
+    @property
+    def _gazetteer_zip_url(self) -> str:
+        year = self._gazetteer_year
+        return f"{GAZETTEER_BASE_URL}/{year}_Gazetteer/{year}_Gaz_counties_national.zip"
+
+    @property
+    def _gazetteer_filename(self) -> str:
+        year = self._gazetteer_year
+        return f"{year}_Gaz_counties_national.txt"
+
     @backoff.on_exception(
         backoff.expo,
         (requests_lib.exceptions.RequestException,),
@@ -83,12 +94,20 @@ class CountyGeographyStream(Stream):
         Returns:
             The raw text content of the Gazetteer tab-delimited file.
         """
-        self.logger.info("Downloading county geography data from Census Gazetteer")
-        response = requests_lib.get(GAZETTEER_ZIP_URL, timeout=(10, 60))
+        url = self._gazetteer_zip_url
+        self.logger.info(
+            "Downloading county geography from %d Gazetteer",
+            self._gazetteer_year,
+        )
+        response = requests_lib.get(url, timeout=(10, 60))
         response.raise_for_status()
 
         with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
-            with zf.open(GAZETTEER_FILENAME) as f:
+            # Find the counties file in the archive (handles minor name variations)
+            names = zf.namelist()
+            target = self._gazetteer_filename
+            filename = target if target in names else names[0]
+            with zf.open(filename) as f:
                 return f.read().decode("utf-8")
 
     @override

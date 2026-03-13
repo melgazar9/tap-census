@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import sys
+from typing import ClassVar
 
 from singer_sdk import Tap
 from singer_sdk import typing as th
 
 from tap_census.streams import (
     CountyGeographyStream,
+    CountyHousingUnitsStream,
+    CountyPopulationCharvStream,
     CountyPopulationStream,
     DecennialPopulationStream,
+    StateHousingUnitsStream,
+    StatePopulationCharvStream,
     StatePopulationStream,
 )
 
@@ -44,25 +49,33 @@ class TapCensus(Tap):
         th.Property(
             "years",
             th.ArrayType(th.IntegerType),
-            default=[2015, 2016, 2017, 2018, 2019, 2020, 2021],
+            default=[2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023],
             description=(
-                "Which years to pull population estimates for. "
-                "PEP county data available: 2010-2019. "
-                "PEP state data available: 2010-2021. "
+                "Which years to pull data for. "
+                "PEP county population: 2010-2019. "
+                "PEP state population: 2010-2021. "
+                "PEP charv population: 2020-2023. "
+                "PEP housing: 2010-2019. "
                 "Decennial: 2000, 2010, 2020."
             ),
         ),
         th.Property(
             "geography_levels",
             th.ArrayType(th.StringType),
-            default=["county"],
+            default=["county", "state"],
             description='Geographic levels to extract. Options: "county", "state".',
         ),
         th.Property(
             "datasets",
             th.ArrayType(th.StringType),
-            default=["pep"],
-            description='Datasets to extract. Options: "pep", "decennial".',
+            default=["pep", "charv"],
+            description=(
+                'Datasets to extract. Options: "pep", "charv", "decennial", "housing". '
+                '"pep" = population estimates 2010-2021 (county 2010-2019, state 2010-2021). '
+                '"charv" = population characteristics 2020-2023 (county + state). '
+                '"decennial" = decennial census counts (2000, 2010, 2020). '
+                '"housing" = housing unit estimates 2010-2019.'
+            ),
         ),
         th.Property(
             "states",
@@ -88,7 +101,28 @@ class TapCensus(Tap):
                 "If False, log warnings and skip failed partitions."
             ),
         ),
+        th.Property(
+            "gazetteer_year",
+            th.IntegerType,
+            default=2024,
+            description=(
+                "Gazetteer file year for county geography (lat/lon centroids). "
+                "Available: 2020-2025. Use 2024+ for CT planning region FIPS codes."
+            ),
+        ),
     ).to_dict()
+
+    # Maps (dataset, geo_level | None) to stream class.
+    # geo_level=None means the stream is always included for that dataset.
+    _STREAM_REGISTRY: ClassVar[list[tuple[str, str | None, type]]] = [
+        ("pep", "county", CountyPopulationStream),
+        ("pep", "state", StatePopulationStream),
+        ("charv", "county", CountyPopulationCharvStream),
+        ("charv", "state", StatePopulationCharvStream),
+        ("decennial", None, DecennialPopulationStream),
+        ("housing", "county", CountyHousingUnitsStream),
+        ("housing", "state", StateHousingUnitsStream),
+    ]
 
     @override
     def discover_streams(self) -> list:
@@ -97,18 +131,14 @@ class TapCensus(Tap):
         Returns:
             A list of stream instances.
         """
-        streams = []
-        datasets = self.config.get("datasets", ["pep"])
-        geo_levels = self.config.get("geography_levels", ["county"])
+        datasets = set(self.config.get("datasets", ["pep", "charv"]))
+        geo_levels = set(self.config.get("geography_levels", ["county", "state"]))
 
-        if "pep" in datasets:
-            if "county" in geo_levels:
-                streams.append(CountyPopulationStream(self))
-            if "state" in geo_levels:
-                streams.append(StatePopulationStream(self))
-
-        if "decennial" in datasets:
-            streams.append(DecennialPopulationStream(self))
+        streams = [
+            cls(self)
+            for dataset, geo, cls in self._STREAM_REGISTRY
+            if dataset in datasets and (geo is None or geo in geo_levels)
+        ]
 
         # County geography is always included — it's essential for
         # joining weather data to population weights via lat/lon centroids.
