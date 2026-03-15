@@ -1,5 +1,5 @@
-version: 1
 send_anonymous_usage_stats: false
+
 project_id: "tap-census"
 
 plugins:

@@ -34,6 +34,27 @@ _HTTP_CLIENT_ERROR_MAX = 500
 _HTTP_TOO_MANY_REQUESTS = 429
 
 
+def _build_non_json_response_error(
+    response: requests_lib.Response,
+    url: str,
+) -> ValueError:
+    """Build a readable error for non-JSON Census API responses."""
+    body = response.text.strip()
+    preview = " ".join(body.split())[:200] or "<empty body>"
+    content_type = response.headers.get("content-type", "unknown")
+
+    if "invalid key" in body.lower():
+        return ValueError(
+            "Census API rejected the configured API key. "
+            "Check `CENSUS_API_KEY` or remove it to use anonymous access."
+        )
+
+    return ValueError(
+        f"Census API returned a non-JSON response for {url} "
+        f"(status={response.status_code}, content_type={content_type}): {preview}"
+    )
+
+
 class CensusStream(RESTStream, ABC):
     """Base stream class for Census API endpoints.
 
@@ -140,7 +161,13 @@ class CensusStream(RESTStream, ABC):
         self._throttle()
         response = self.requests_session.get(url, params=params, timeout=(10, 30))
         response.raise_for_status()
-        return response.json()
+        if not response.text.strip():
+            self.logger.debug("Census API returned empty body for %s", url)
+            return None
+        try:
+            return response.json()
+        except requests_lib.exceptions.JSONDecodeError as exc:
+            raise _build_non_json_response_error(response, url) from exc
 
     def _fetch_census_data(
         self,

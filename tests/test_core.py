@@ -5,8 +5,10 @@ from __future__ import annotations
 import os
 
 import pytest
+import requests
 from singer_sdk.testing import get_tap_test_class
 
+from tap_census.client import _build_non_json_response_error
 from tap_census.helpers import make_fips, parse_census_array, safe_float, safe_int
 from tap_census.streams.housing_streams import HOUSING_YEARS
 from tap_census.streams.population_streams import (
@@ -75,6 +77,48 @@ class TestHelpers:
         assert safe_float("") is None
         assert safe_float("null") is None
         assert safe_float("abc") is None
+
+
+class TestResponseErrors:
+    """Test error messages for non-JSON Census API responses."""
+
+    @staticmethod
+    def _make_response(body: str, content_type: str) -> requests.Response:
+        response = requests.Response()
+        response.status_code = 200
+        response.headers["content-type"] = content_type
+        response._content = body.encode("utf-8")
+        response.encoding = "utf-8"
+        return response
+
+    def test_invalid_key_html_returns_clear_message(self) -> None:
+        response = self._make_response(
+            "<html><head><title>Invalid Key</title></head></html>",
+            "text/html",
+        )
+
+        error = _build_non_json_response_error(
+            response,
+            "https://api.census.gov/data/2019/pep/population",
+        )
+
+        assert "configured API key" in str(error)
+        assert "CENSUS_API_KEY" in str(error)
+
+    def test_generic_non_json_response_includes_preview(self) -> None:
+        response = self._make_response(
+            "error: unsupported geography predicate",
+            "text/plain",
+        )
+
+        error = _build_non_json_response_error(
+            response,
+            "https://api.census.gov/data/2019/pep/population",
+        )
+
+        assert "non-JSON response" in str(error)
+        assert "unsupported geography predicate" in str(error)
+        assert "text/plain" in str(error)
 
 
 class TestVintageLookup:
